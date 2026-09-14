@@ -1,21 +1,19 @@
 """
-etl_pipeline.py
+etl_pipeline.py (v2)
 
-Pipeline de coleta de dados históricos e cálculo do índice de risco de
-desertificação para os municípios do semiárido de Pernambuco.
+Busca dados históricos de satélite no Google Earth Engine e ENVIA para o
+endpoint de ingestão que o Lovable criou (/api/public/ingest) — não conecta
+mais direto no banco de dados.
 
 Fluxo:
-  1. Lê a geometria de cada município (já carregada no banco).
-  2. Para cada um, busca no Google Earth Engine (gratuito, sem custo de
-     processamento): NDVI (Sentinel-2), temperatura de superfície — LST
-     (MODIS) e chuva acumulada/anomalia (CHIRPS).
-  3. Calcula um índice de risco (ESAI adaptado) e classifica em
-     baixo / médio / alto.
-  4. Grava tudo no banco (Supabase Postgres) e gera alertas automáticos.
+  1. Lê a lista de municípios de um arquivo GeoJSON local (pe_municipios.json).
+  2. Para cada um, busca no Earth Engine: NDVI (Sentinel-2), temperatura de
+     superfície - LST (MODIS) e chuva acumulada/anomalia (CHIRPS).
+  3. Calcula um índice de risco (ESAI adaptado).
+  4. Envia tudo em lotes (POST) para o endpoint do Lovable, que grava no
+     banco e calcula a classificação de risco automaticamente.
 
-Rode isso periodicamente (ex.: 1x por semana) via GitHub Actions, cron ou
-Cloud Scheduler + Cloud Run Job — NUNCA dentro do Lovable, que não executa
-Python. O Lovable só lê o resultado, direto do Supabase.
+Rode isso periodicamente (ex.: 1x por semana) via GitHub Actions.
 """
 
 import datetime as dt
@@ -23,24 +21,28 @@ import os
 
 import ee
 import geopandas as gpd
+import requests
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
 
 load_dotenv()
 
-DATABASE_URL = os.environ["SUPABASE_DB_URL"]
+INGEST_URL = os.environ["INGEST_URL"]      # ex: https://seu-projeto.lovable.app/api/public/ingest
+INGEST_TOKEN = os.environ["INGEST_TOKEN"]  # o token gerado com openssl rand -hex 32
+MUNICIPIOS_GEOJSON = os.environ.get("MUNICIPIOS_GEOJSON", "pe_municipios.json")
 
 # Janela de análise do "instantâneo" atual
 DATA_FIM = dt.date.today()
 DATA_INICIO = DATA_FIM - dt.timedelta(days=90)
 # Quantos anos olhar para trás para calcular a média histórica de chuva (anomalia)
 JANELA_HISTORICA_ANOS = 15
+# Limite de registros por chamada, informado pelo endpoint do Lovable
+TAMANHO_LOTE = 500
 
 
 def autenticar_gee():
     """Autentica no Earth Engine via conta de serviço.
-    Crie a conta em console.cloud.google.com, ative a 'Earth Engine API'
-    e baixe a chave JSON. Guarde o caminho em GEE_PRIVATE_KEY_PATH.
+    GEE_SERVICE_ACCOUNT: e-mail da conta de serviço (ex: desertificacao-pe@desertificacao-pe.iam.gserviceaccount.com)
+    GEE_PRIVATE_KEY_PATH: caminho do arquivo .json baixado no Google Cloud Console
     """
     service_account = os.environ["GEE_SERVICE_ACCOUNT"]
     key_path = os.environ["GEE_PRIVATE_KEY_PATH"]
@@ -48,13 +50,9 @@ def autenticar_gee():
     ee.Initialize(credentials)
 
 
-def carregar_municipios(engine) -> gpd.GeoDataFrame:
-    """Lê os municípios direto do banco (já carregados via carregar_municipios.py)."""
-    return gpd.read_postgis(
-        "select id, codigo_ibge, nome, geom as geometry from municipios",
-        engine,
-        geom_col="geometry",
-    )
+def carregar_municipios() -> gpd.GeoDataFrame:
+    """Lê os municípios e suas geometrias de um GeoJSON local."""
+    return gpd.read_file(MUNICIPIOS_GEOJSON)
 
 
 def ee_geometria(geom_shapely) -> ee.Geometry:
@@ -132,10 +130,9 @@ def normalizar(valor, minimo, maximo):
 
 
 def calcular_indice_esai(ndvi, lst, chuva_anomalia, pressao_antropica=0.5) -> float:
-    """Índice adaptado do ESAI (Environmentally Sensitive Area Index — MEDALUS),
-    combinando quatro subíndices normalizados de 0 (baixo risco) a 1 (alto risco).
-    Os limites de normalização (minimo/maximo) devem ser calibrados com dados
-    reais do semiárido de PE conforme o histórico for se acumulando.
+    """Índice adaptado do ESAI (Environmentally Sensitive Area Index — MEDALUS).
+    0 = risco mínimo, 1 = risco crítico. Os limites de normalização devem ser
+    calibrados com dados reais do semiárido de PE conforme o histórico crescer.
     """
     risco_vegetacao = 1 - normalizar(ndvi, minimo=0.1, maximo=0.6)
     risco_clima_temp = normalizar(lst, minimo=25, maximo=42)
@@ -152,17 +149,11 @@ def calcular_indice_esai(ndvi, lst, chuva_anomalia, pressao_antropica=0.5) -> fl
     return round(indice, 3)
 
 
-def classificar_risco(indice: float) -> str:
-    if indice < 0.35:
-        return "baixo"
-    if indice < 0.6:
-        return "medio"
-    return "alto"
-
-
-def processar_municipio(row, engine):
-    nome = row["nome"]
-    municipio_id = row["id"]
+def montar_registro(row) -> dict:
+    """Busca os indicadores de um município no Earth Engine e monta o
+    registro no formato esperado pelo endpoint de ingestão."""
+    codigo = str(row["id"])
+    nome = row["name"]
     geom_ee = ee_geometria(row["geometry"])
 
     ndvi = calcular_ndvi(geom_ee, DATA_INICIO.isoformat(), DATA_FIM.isoformat())
@@ -170,83 +161,52 @@ def processar_municipio(row, engine):
     chuva_mm, chuva_anomalia = calcular_chuva(
         geom_ee, DATA_INICIO.isoformat(), DATA_FIM.isoformat()
     )
-
     indice = calcular_indice_esai(ndvi, lst, chuva_anomalia)
-    classificacao = classificar_risco(indice)
-
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                insert into indicadores_historicos
-                    (municipio_id, data, ndvi_medio, lst_medio, chuva_mm, chuva_anomalia)
-                values (:municipio_id, :data, :ndvi, :lst, :chuva_mm, :chuva_anomalia)
-                on conflict (municipio_id, data) do update set
-                    ndvi_medio = excluded.ndvi_medio,
-                    lst_medio = excluded.lst_medio,
-                    chuva_mm = excluded.chuva_mm,
-                    chuva_anomalia = excluded.chuva_anomalia
-                """
-            ),
-            {
-                "municipio_id": municipio_id,
-                "data": DATA_FIM,
-                "ndvi": ndvi,
-                "lst": lst,
-                "chuva_mm": chuva_mm,
-                "chuva_anomalia": chuva_anomalia,
-            },
-        )
-
-        conn.execute(
-            text(
-                """
-                insert into risco_desertificacao
-                    (municipio_id, data_calculo, indice_esai, classificacao)
-                values (:municipio_id, :data, :indice, :classificacao)
-                on conflict (municipio_id, data_calculo) do update set
-                    indice_esai = excluded.indice_esai,
-                    classificacao = excluded.classificacao
-                """
-            ),
-            {
-                "municipio_id": municipio_id,
-                "data": DATA_FIM,
-                "indice": indice,
-                "classificacao": classificacao,
-            },
-        )
-
-        if classificacao == "alto":
-            conn.execute(
-                text(
-                    """
-                    insert into alertas (municipio_id, tipo, descricao)
-                    values (:municipio_id, 'risco_alto', :descricao)
-                    """
-                ),
-                {
-                    "municipio_id": municipio_id,
-                    "descricao": f"{nome} atingiu classificação de risco alto (índice {indice}).",
-                },
-            )
 
     print(
         f"[ok] {nome}: NDVI={ndvi:.3f} LST={lst:.1f}C chuva_anom={chuva_anomalia:.2f} "
-        f"-> risco={classificacao}"
+        f"indice_esai={indice}"
     )
+
+    return {
+        "codigo_ibge": codigo,
+        "data": DATA_FIM.isoformat(),
+        "ndvi_medio": round(ndvi, 3) if ndvi is not None else None,
+        "chuva_mm": round(chuva_mm, 1) if chuva_mm is not None else None,
+        "chuva_anomalia": round(chuva_anomalia, 3) if chuva_anomalia is not None else None,
+        "lst_medio": round(lst, 1) if lst is not None else None,
+        "pressao_antropica": 0.5,
+        "indice_esai": indice,
+    }
+
+
+def enviar_lote(registros: list) -> dict:
+    """Envia um lote de registros para o endpoint de ingestão do Lovable."""
+    resposta = requests.post(
+        INGEST_URL,
+        headers={"x-ingest-token": INGEST_TOKEN},
+        json={"registros": registros},
+        timeout=60,
+    )
+    resposta.raise_for_status()
+    return resposta.json()
 
 
 def main():
     autenticar_gee()
-    engine = create_engine(DATABASE_URL)
-    municipios = carregar_municipios(engine)
+    municipios = carregar_municipios()
 
+    registros = []
     for _, row in municipios.iterrows():
         try:
-            processar_municipio(row, engine)
+            registros.append(montar_registro(row))
         except Exception as erro:
-            print(f"[erro] {row['nome']}: {erro}")
+            print(f"[erro] {row.get('name')}: {erro}")
+
+    for inicio in range(0, len(registros), TAMANHO_LOTE):
+        lote = registros[inicio : inicio + TAMANHO_LOTE]
+        resultado = enviar_lote(lote)
+        print(f"[envio] lote de {len(lote)} registros -> {resultado}")
 
 
 if __name__ == "__main__":
