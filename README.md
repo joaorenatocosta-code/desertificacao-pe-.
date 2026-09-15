@@ -1,94 +1,45 @@
-# Plataforma de monitoramento de desertificação — semiárido de PE
+Plataforma de monitoramento de desertificação — semiárido de PE
 
-Pipeline de dados + banco + API para alimentar um site (aqui ou no Lovable)
-com histórico e risco de desertificação por município.
+Pipeline de dados que busca histórico de satélite e envia para o site feito no Lovable, via endpoint de ingestão protegido por token.
 
-## Licença
+Licença
 
-Este código é distribuído sob licença MIT (adicione um arquivo `LICENSE`
-com o texto padrão da MIT antes de subir ao GitHub). Isso permite que a
-SEMAS/PE e a CPRH usem, modifiquem e mantenham o sistema livremente.
+Este código é distribuído sob licença MIT (adicione um arquivo LICENSE com o texto padrão da MIT). Isso permite que a SEMAS/PE e a CPRH usem, modifiquem e mantenham o sistema livremente.
 
-## Como as peças se encaixam
-
-```
+Como as peças se encaixam
 Google Earth Engine (satélite, clima)
         │
         ▼
-etl_pipeline.py  ──────────►  Supabase (Postgres + PostGIS)  ◄──────────  Lovable (frontend)
-        ▲                              ▲
-        │                              │
-carregar_municipios.py          api.py (opcional, só se
-(carga única dos limites          NÃO for usar o Lovable)
-municipais)
-```
+etl_pipeline.py  ──── POST com token ────►  /api/public/ingest (Lovable)
+        │                                          │
+   pe_municipios.json                       grava no banco e
+   (lista de municípios                     calcula a classe de
+   e suas geometrias)                       risco automaticamente
 
-O `etl_pipeline.py` roda fora do Lovable (Lovable não executa Python) —
-localmente, em GitHub Actions, ou num Cloud Scheduler. O Lovable só lê o
-resultado, direto do banco Supabase.
+O etl_pipeline.py roda fora do Lovable (localmente ou via GitHub Actions agendado) — o Lovable não executa Python. Ele só recebe os dados prontos pelo endpoint HTTP que o próprio Lovable criou.
 
-## Passo a passo
+Passo a passo
+1. Publicar o app no Lovable
 
-### 1. Criar o projeto Supabase
-- No Lovable: `Settings → Connectors → Supabase` (ou use o backend padrão
-  do Lovable Cloud, que já é Supabase por baixo).
-- Se preferir criar você mesmo: [supabase.com](https://supabase.com) → novo projeto.
+O endpoint de ingestão tem uma URL de "preview" (temporária) e uma de "produção" (depois de publicar). Para automação de verdade, publique o app e use a URL de produção.
 
-### 2. Rodar o schema
-- Abra o editor SQL do Supabase e cole o conteúdo de `schema.sql`. Isso cria
-  as tabelas, a extensão PostGIS e a view `v_risco_atual`.
+2. Preencher as variáveis de ambiente
 
-### 3. Preencher as variáveis de ambiente
-- Copie `.env.example` para `.env` e preencha com:
-  - `SUPABASE_DB_URL`: em Supabase → Settings → Database → Connection string.
-  - `GEE_SERVICE_ACCOUNT` e `GEE_PRIVATE_KEY_PATH`: crie uma conta de serviço
-    em [console.cloud.google.com](https://console.cloud.google.com), ative a
-    "Earth Engine API" e baixe a chave JSON.
+Copie .env.example para .env e preencha:
 
-### 4. Instalar dependências e carregar os municípios (uma vez só)
-```bash
+INGEST_URL: a URL de produção do endpoint (.../api/public/ingest).
+INGEST_TOKEN: o mesmo token que você gerou e salvou como secret no Lovable.
+GEE_SERVICE_ACCOUNT e GEE_PRIVATE_KEY_PATH: da conta de serviço criada no Google Cloud (veja o arquivo .json baixado).
+3. Instalar dependências
+bash
 pip install -r requirements.txt
-python carregar_municipios.py
-```
-Antes disso, baixe a malha municipal do IBGE, filtre só os municípios do
-semiárido de PE e salve como `municipios_semiarido_pe.geojson` (veja o
-comentário no topo de `carregar_municipios.py`).
-
-### 5. Rodar o pipeline de dados
-```bash
+4. Rodar o pipeline
+bash
 python etl_pipeline.py
-```
-Isso busca NDVI, temperatura de superfície e chuva no Earth Engine, calcula
-o índice de risco e grava tudo no Supabase. Agende para rodar 1x por semana
-(GitHub Actions com `schedule: cron` é a forma mais simples e gratuita).
 
-### 6. Construir o site no Lovable
-No chat do Lovable, depois de conectar o Supabase, um prompt como este já
-é suficiente para gerar a tela:
+Isso busca NDVI, temperatura de superfície e chuva no Earth Engine para cada município listado em pe_municipios.json, calcula o índice de risco e envia tudo em lotes para o endpoint do Lovable. Agende para rodar 1x por semana (GitHub Actions com schedule: cron é a forma mais simples e gratuita).
 
-> "Conecte ao meu projeto Supabase. Crie uma página com um mapa mostrando
-> os municípios da view `v_risco_atual`, coloridos por `classificacao`
-> (verde=baixo, amarelo=medio, vermelho=alto). Ao clicar em um município,
-> mostre um gráfico com o histórico de `ndvi_medio` e `chuva_mm` da tabela
-> `indicadores_historicos`. Inclua também uma lista dos alertas não lidos
-> da tabela `alertas`."
-
-O Lovable gera o schema de acesso (Row Level Security), as queries e a
-interface automaticamente a partir disso.
-
-### 7. (Opcional) Rodar a API própria
-Só necessário se você quiser hospedar o site aqui mesmo (fora do Lovable)
-ou servir os dados para outro sistema:
-```bash
-uvicorn api:app --reload
-```
-Endpoints disponíveis: `/municipios/risco`, `/municipios/{id}/historico`,
-`/alertas`.
-
-## Próximos passos sugeridos
-- Trocar a `pressao_antropica` (hoje um valor fixo de 0.5) por um dado real,
-  como densidade populacional do IBGE ou densidade de rebanho da PPM/IBGE.
-- Calibrar os limites de normalização em `calcular_indice_esai` com dados
-  reais do semiárido de PE, em vez dos valores de referência da literatura.
-- Adicionar dados da APAC/INMET/INSA como fontes complementares às do
-  Earth Engine, para validação cruzada.
+Próximos passos sugeridos
+Filtrar pe_municipios.json para conter só os municípios do semiárido, em vez dos 185 municípios do estado inteiro.
+Trocar a pressao_antropica (hoje fixa em 0.5) por um dado real, como densidade populacional do IBGE.
+Calibrar os limites de normalização em calcular_indice_esai com dados reais do semiárido de PE.
